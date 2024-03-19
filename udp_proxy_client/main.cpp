@@ -20,16 +20,16 @@ uv_loop_t *loop = nullptr;
 int64_t now_ms = 0;
 bool g_debug = false;
 
-std::string out_udp_server_ip = "8.219.130.15";
+std::string out_udp_server_ip = "127.0.0.1";
 int out_udp_server_port = 1106;
 
-std::string dest_udp_server_ip = "11.160.74.225";
+std::string dest_udp_server_ip = "127.0.0.1";
 int dest_udp_server_port = 58033;
 
-std::string out_tcp_server_ip = "8.219.130.15";
+std::string out_tcp_server_ip = "127.0.0.1";
 int out_tcp_server_port = 1107;
 
-std::string dest_tcp_server_ip = "11.160.74.225";
+std::string dest_tcp_server_ip = "127.0.0.1";
 int dest_tcp_server_port = 1107;
 
 int64_t time_out_ms = 3000;
