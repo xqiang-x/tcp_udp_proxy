@@ -390,7 +390,7 @@ void close_connect(TcpConnectInfo* tcp_connect_info, bool is_server) {
         uv_close(reinterpret_cast<uv_handle_t *>(tcp_connect_info->tcp_watcher_to_server), [](uv_handle_t *handle) {
             auto *tcp = (TcpConnectInfo *) handle->data;
             tcp->server_closed = true;
-            if (tcp->tcp_watcher_to_dest) {
+            if (tcp->tcp_watcher_to_dest && !tcp->local_closed) {
                 if (tcp->send_queue_to_dest.empty() && !tcp->local_is_sending) {
                     uv_close(reinterpret_cast<uv_handle_t *>(tcp->tcp_watcher_to_dest), [](uv_handle_t *handle) {
                         delete (TcpConnectInfo *) handle->data;
@@ -410,7 +410,7 @@ void close_connect(TcpConnectInfo* tcp_connect_info, bool is_server) {
         uv_close(reinterpret_cast<uv_handle_t *>(tcp_connect_info->tcp_watcher_to_dest), [](uv_handle_t *handle) {
             auto *tcp = (TcpConnectInfo *) handle->data;
             tcp->local_closed = true;
-            if (tcp->send_queue_to_server.empty() && !tcp->server_is_sending) {
+            if (tcp->send_queue_to_server.empty() && !tcp->server_is_sending && !tcp->server_closed) {
                 uv_close(reinterpret_cast<uv_handle_t *>(tcp->tcp_watcher_to_server), [](uv_handle_t *handle) {
                     delete (TcpConnectInfo *) handle->data;
                 });
