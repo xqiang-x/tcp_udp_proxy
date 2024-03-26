@@ -60,11 +60,13 @@ struct TcpConnectInfo {
     std::list<NetBuffer> send_queue_to_server;
     bool server_is_sending = false;
     bool server_close = false;
+    bool server_closed = false;
 
     uv_write_t tcp_write_req_to_dest{};
     std::list<NetBuffer> send_queue_to_dest;
     bool local_is_sending = false;
     bool local_close = false;
+    bool local_closed = false;
 };
 
 struct PreparationInfo {
@@ -80,10 +82,10 @@ struct OutOfOrderBuffer {
 };
 
 int64_t getSysTimeMs();
-static void SendOutOfOrderBufferList();
 static void SendOutOfOrderBufferList(bool send_now);
 void session_enable_write(TcpConnectInfo *session, bool to_server);
 bool bind_client(TcpConnectInfo *tcp_connect_info, ssize_t nRead, const uv_buf_t *buf);
+void close_connect(TcpConnectInfo* tcp_connect_info, bool is_server);
 
 uint8_t udpRecvBuf[UDP_RECV_BUFFER_LEN];
 
@@ -242,6 +244,19 @@ static void fun_send_order_timer(uv_timer_t *handle) {
     }
 }
 
+static void check_and_bind_client() {
+    if (wait_for_bind.empty()) {
+        return;
+    }
+    for (auto v = wait_for_bind.begin(); v != wait_for_bind.end();) {
+        if (bind_client(*v, 0, nullptr)) {
+            v = wait_for_bind.erase(v);
+            continue;
+        }
+        break;
+    }
+}
+
 static void fun_check_timer(uv_timer_t *handle) {
     now_ms = getSysTimeMs();
 
@@ -275,13 +290,7 @@ static void fun_check_timer(uv_timer_t *handle) {
         delete v;
     }
 
-    for (auto v = wait_for_bind.begin(); v != wait_for_bind.end();) {
-        if (bind_client(*v, 0, nullptr)) {
-            v = wait_for_bind.erase(v);
-            continue;
-        }
-        break;
-    }
+    check_and_bind_client();
 
     erase_set.clear();
 }
@@ -289,6 +298,7 @@ static void fun_check_timer(uv_timer_t *handle) {
 void write_cb(uv_write_t *req, int status) {
     if (status != 0) {
         printf("write_cb error\n");
+        return;
     }
     auto *session = (TcpConnectInfo *) req->data;
     bool is_server = (req == &session->tcp_write_req_to_server);
@@ -308,11 +318,8 @@ void write_cb(uv_write_t *req, int status) {
 void session_enable_write(TcpConnectInfo *session, bool to_server) {
     if (to_server) {
         if (session->send_queue_to_server.empty() || session->server_is_sending || session->server_close) {
-            if (!session->server_is_sending && session->local_close) {
-                uv_close(reinterpret_cast<uv_handle_t *>(session->tcp_watcher_to_server), [](uv_handle_t *handle) {
-                    auto *tcp = (TcpConnectInfo *) handle->data;
-                    delete tcp;
-                });
+            if (!session->server_is_sending && session->local_closed) {
+                close_connect(session, to_server);
             }
             return;
         }
@@ -324,11 +331,8 @@ void session_enable_write(TcpConnectInfo *session, bool to_server) {
         uv_write(&session->tcp_write_req_to_server, (uv_stream_t *) session->tcp_watcher_to_server, bufs, 1, write_cb);
     } else {
         if (session->send_queue_to_dest.empty() || session->local_is_sending || session->local_close) {
-            if (!session->local_is_sending && session->server_close) {
-                uv_close(reinterpret_cast<uv_handle_t *>(session->tcp_watcher_to_dest), [](uv_handle_t *handle) {
-                    auto *tcp = (TcpConnectInfo *) handle->data;
-                    delete tcp;
-                });
+            if (!session->local_is_sending && session->server_closed) {
+                close_connect(session, to_server);
             }
             return;
         }
@@ -345,11 +349,11 @@ bool bind_client(TcpConnectInfo *tcp_connect_info, ssize_t nRead, const uv_buf_t
     if (wait_for_tcp.empty()) {
         return false;
     }
-    printf("bind one client\n");
     auto it = wait_for_tcp.begin();
     TcpConnectInfo *t2 = *it;
     wait_for_tcp.erase(it);
     t2->tcp_watcher_to_dest = tcp_connect_info->unidentified;
+    tcp_connect_info->unidentified = nullptr;
     t2->tcp_watcher_to_dest->data = t2;
 
     while (!tcp_connect_info->send_queue_to_server.empty()) {
@@ -365,65 +369,71 @@ bool bind_client(TcpConnectInfo *tcp_connect_info, ssize_t nRead, const uv_buf_t
         t2->send_queue_to_server.push_back(buffer);
     }
     session_enable_write(t2, true);
-    tcp_connect_info->unidentified = nullptr;
     delete tcp_connect_info;
     return true;
+}
+
+void close_connect(TcpConnectInfo* tcp_connect_info, bool is_server) {
+    if (tcp_connect_info->unidentified) {
+        wait_for_bind.erase(tcp_connect_info);
+        uv_close(reinterpret_cast<uv_handle_t *>(tcp_connect_info->unidentified), [](uv_handle_t *handle) {
+            delete (TcpConnectInfo *) handle->data;
+        });
+        return;
+    }
+
+    if (is_server) {
+        if (tcp_connect_info->server_close || (tcp_connect_info->local_close && !tcp_connect_info->local_closed)) {
+            return;
+        }
+        tcp_connect_info->server_close = true;
+        uv_close(reinterpret_cast<uv_handle_t *>(tcp_connect_info->tcp_watcher_to_server), [](uv_handle_t *handle) {
+            auto *tcp = (TcpConnectInfo *) handle->data;
+            tcp->server_closed = true;
+            if (tcp->tcp_watcher_to_dest) {
+                if (tcp->send_queue_to_dest.empty() && !tcp->local_is_sending) {
+                    uv_close(reinterpret_cast<uv_handle_t *>(tcp->tcp_watcher_to_dest), [](uv_handle_t *handle) {
+                        delete (TcpConnectInfo *) handle->data;
+                    });
+                }
+            } else {
+                // 服务器没有绑定客户端直接删除
+                wait_for_tcp.erase(tcp);
+                delete tcp;
+            }
+        });
+    } else {
+        if (tcp_connect_info->local_close || (tcp_connect_info->server_close && !tcp_connect_info->server_closed)) {
+            return;
+        }
+        tcp_connect_info->local_close = true;
+        uv_close(reinterpret_cast<uv_handle_t *>(tcp_connect_info->tcp_watcher_to_dest), [](uv_handle_t *handle) {
+            auto *tcp = (TcpConnectInfo *) handle->data;
+            tcp->local_closed = true;
+            if (tcp->send_queue_to_server.empty() && !tcp->server_is_sending) {
+                uv_close(reinterpret_cast<uv_handle_t *>(tcp->tcp_watcher_to_server), [](uv_handle_t *handle) {
+                    delete (TcpConnectInfo *) handle->data;
+                });
+            }
+        });
+    }
 }
 
 void tcp_cb(uv_stream_t *handle, ssize_t nRead, const uv_buf_t *buf) {
     auto *tcp_connect_info = (TcpConnectInfo *) handle->data;
     if (nRead <= 0) {
-        if (tcp_connect_info->unidentified) {
-            printf("close one unidentified client\n");
-            wait_for_bind.erase(tcp_connect_info);
-            uv_close(reinterpret_cast<uv_handle_t *>(tcp_connect_info->unidentified), [](uv_handle_t *handle) {
-                auto *tcp = (TcpConnectInfo *) handle->data;
-                delete tcp;
-            });
-            return;
-        }
-
-        if (handle == (uv_stream_t *) tcp_connect_info->tcp_watcher_to_server) {
-            tcp_connect_info->server_close = true;
-            printf("close tcp_watcher_to_server\n");
-            uv_close(reinterpret_cast<uv_handle_t *>(tcp_connect_info->tcp_watcher_to_server), [](uv_handle_t *handle) {
-                auto *tcp = (TcpConnectInfo *) handle->data;
-                if (tcp->tcp_watcher_to_dest) {
-                    if (tcp->send_queue_to_dest.empty() && !tcp->local_is_sending) {
-                        uv_close(reinterpret_cast<uv_handle_t *>(tcp->tcp_watcher_to_dest), [](uv_handle_t *handle) {
-                            auto *tcp = (TcpConnectInfo *) handle->data;
-                            delete tcp;
-                        });
-                    }
-                } else {
-                    // 服务器没有绑定客户端直接删除
-                    wait_for_tcp.erase(tcp);
-                    delete tcp;
-                }
-            });
-        } else {
-            tcp_connect_info->local_close = true;
-            printf("close tcp_watcher_to_dest\n");
-            uv_close(reinterpret_cast<uv_handle_t *>(tcp_connect_info->tcp_watcher_to_dest), [](uv_handle_t *handle) {
-                auto *tcp = (TcpConnectInfo *) handle->data;
-                if (tcp->send_queue_to_server.empty() && !tcp->server_is_sending) {
-                    uv_close(reinterpret_cast<uv_handle_t *>(tcp->tcp_watcher_to_server), [](uv_handle_t *handle) {
-                        auto *tcp = (TcpConnectInfo *) handle->data;
-                        delete tcp;
-                    });
-                }
-            });
-        }
+        printf("close_connect %d \n", handle == (uv_stream_t *) tcp_connect_info->tcp_watcher_to_server);
+        close_connect(tcp_connect_info, handle == (uv_stream_t *) tcp_connect_info->tcp_watcher_to_server);
         return;
     }
 
     if (tcp_connect_info->unidentified) {
         if (tcp_connect_info->send_queue_to_server.empty() && nRead >= 2 && buf->base[0] == heart_bit_buf[0] &&
             buf->base[1] == heart_bit_buf[1]) {
-            printf("add on proxy\n");
             tcp_connect_info->tcp_watcher_to_server = tcp_connect_info->unidentified;
             tcp_connect_info->unidentified = nullptr;
             wait_for_tcp.insert(tcp_connect_info);
+            check_and_bind_client();
             return;
         } else {
             if (wait_for_tcp.empty()) {
@@ -473,7 +483,7 @@ void on_new_connection(uv_stream_t *server, int status) {
         uv_read_start((uv_stream_t *) client, alloc_cb_tcp, tcp_cb);
     } else {
         uv_close((uv_handle_t *) client, [](uv_handle_t *handle) {
-            free(handle);
+            delete (TcpConnectInfo*)handle->data;
         });
     }
 }
@@ -512,14 +522,14 @@ static void signal_pipe_fun(int signal_type) {
 
 void print_help(const char* name) {
     fprintf(stderr, "Usage: %s [OPTION]\n"
-                                    "\t-i, --udp_ip\n"
-                                    "\t-p, --udp_port\n"
-                                    "\t-I, --tcp_ip\n"
-                                    "\t-P, --tcp_port\n"
-                                    "\t-j, --just_udp\n"
-                                    "\t-J, --just_tcp\n"
-                                    "\t-d, --daemon\n"
-                                    "\t-D, --debug\n",name
+                    "\t-i, --udp_ip\n"
+                    "\t-p, --udp_port\n"
+                    "\t-I, --tcp_ip\n"
+                    "\t-P, --tcp_port\n"
+                    "\t-j, --just_udp\n"
+                    "\t-J, --just_tcp\n"
+                    "\t-d, --daemon\n"
+                    "\t-D, --debug\n",name
     );
 }
 
@@ -533,22 +543,22 @@ int main(int argc, char *argv[]) {
     int ot = 10;
 
     struct option longOpts[] =
-        {
-                {"udp_ip",       required_argument, 0,          'i'},
-                {"udp_port",     required_argument, 0,          'p'},
-                {"tcp_ip",     required_argument, 0,          'I'},
-                {"tcp_port",   required_argument, 0,          'P'},
-                {"just_udp", no_argument,       0,          'j'},
-                {"just_tcp", no_argument,       0,          'J'},
-                {"daemon",   no_argument,       0,          'd'},
-                // 下面的没有
-                {"debug",    no_argument,       0,          'D'},
-                {"order",    no_argument,       0,          'O'},
-                {"out",      required_argument, 0,          't'},
-                {"out_order",required_argument, 0,          's'},
-                {"help", 0,                     &help_flag, 1},
-                {0,      0,                     0,          0}
-        };
+            {
+                    {"udp_ip",       required_argument, 0,          'i'},
+                    {"udp_port",     required_argument, 0,          'p'},
+                    {"tcp_ip",     required_argument, 0,          'I'},
+                    {"tcp_port",   required_argument, 0,          'P'},
+                    {"just_udp", no_argument,       0,          'j'},
+                    {"just_tcp", no_argument,       0,          'J'},
+                    {"daemon",   no_argument,       0,          'd'},
+                    // 下面的没有
+                    {"debug",    no_argument,       0,          'D'},
+                    {"order",    no_argument,       0,          'O'},
+                    {"out",      required_argument, 0,          't'},
+                    {"out_order",required_argument, 0,          's'},
+                    {"help", 0,                     &help_flag, 1},
+                    {0,      0,                     0,          0}
+            };
 
     //有：表示有参数，两个：表示参数可选
     while ((c = getopt_long(argc, argv, "i:p:dDhI:P:Ojt:s:J?", longOpts, nullptr)) != EOF) {
