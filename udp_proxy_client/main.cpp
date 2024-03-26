@@ -432,7 +432,7 @@ void print_help() {
             "\t-p, --out_udp_server_port\n "
             "\t-I, --dest_udp_server_ip\n "
             "\t-P, --dest_udp_server_port\n "
-            "\t-x, --desable_udp\n"
+            "\t-x, --disable_udp\n"
             "\t-m, --out_tcp_server_ip\n "
             "\t-n, --out_tcp_server_port\n "
             "\t-M, --dest_tcp_server_ip\n "
@@ -452,7 +452,7 @@ int main(int argc, char *argv[]) {
                 {"udp_server_port",   required_argument, 0,        'p'},
                 {"udp_dest_ip",       required_argument, 0,        'I'},
                 {"udp_dest_port",     required_argument, 0,        'P'},
-                {"disable_udp",       required_argument, 0,        'x'},
+                {"disable_udp",       no_argument,       0,        'x'},
                 {"tcp_server_ip",     required_argument, 0,        'm'},
                 {"tcp_server_port",   required_argument, 0,        'n'},
                 {"tcp_dest_ip",       required_argument, 0,        'M'},
